@@ -1,0 +1,9 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - transformers
+  - python=3.15
+  - pytorch
+  - safetensors
+  - pytest

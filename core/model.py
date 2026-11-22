@@ -1,3 +1,5 @@
+import re
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -58,33 +60,48 @@ class GroupQueryAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_att_heads * self.head_dim, config.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache: Cache = None, start_pos: int = 0) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            cache: Cache = None,
+            start_pos: int = None,
+            pad_size: torch.Tensor = None
+            ) -> torch.Tensor:
         batch_size, num_tokens, _ = x.size()
-        if cache is None:
+        if start_pos is None:
             start_pos = 0
+        if pad_size is None:
+            pad_size = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
 
         q = self.q_proj(x).view(batch_size, num_tokens, self.num_att_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, num_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, num_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        k = apply_rope(k, cos[start_pos:start_pos + num_tokens], sin[start_pos:start_pos + num_tokens])
-        q = apply_rope(q, cos[start_pos:start_pos + num_tokens], sin[start_pos:start_pos + num_tokens])
+        cos = cos.unsqueeze(1)  # (B, 1, T, head_dim)
+        sin = sin.unsqueeze(1)
+        k = apply_rope(k, cos, sin)
+        q = apply_rope(q, cos, sin)
 
         if cache is not None:
             cache.update(self.layer_idx, k, v, start_pos)
             k, v = cache.get(self.layer_idx, 0, start_pos + num_tokens)
-    
+
         k = k.repeat_interleave(self.num_att_heads // self.num_kv_heads, dim=1)
         v = v.repeat_interleave(self.num_att_heads // self.num_kv_heads, dim=1)
 
         attn_weights = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        if num_tokens > 1:
-            total_len = k.size(2)
-            q_pos = torch.arange(num_tokens, device=x.device) + start_pos
-            k_pos = torch.arange(total_len, device=x.device)
-            causal_mask = torch.zeros(num_tokens, total_len, device=x.device, dtype=attn_weights.dtype)
-            causal_mask = causal_mask.masked_fill(k_pos[None, :] > q_pos[:, None], float('-inf'))
-            attn_weights += causal_mask
+
+        total_len = k.size(2)
+        q_pos = start_pos + torch.arange(num_tokens, device=x.device)             # (T,)
+        k_pos = torch.arange(total_len, device=x.device)                          # (total_len,)
+        pad_border = pad_size[:, None, None]                                      # (B, 1, 1)
+        causal_mask = k_pos[None, None, :] > q_pos[None, :, None]
+        pad_key = k_pos[None, None, :] < pad_border
+        real_query = q_pos[None, :, None] >= pad_border
+        causal_mask = causal_mask | (pad_key & real_query)                        # (B, T, total_len)
+        attn_weights = attn_weights.masked_fill(causal_mask[:, None, :, :], float('-inf'))
         attn_weights = F.softmax(attn_weights, dim=-1)
 
         attn_output = attn_weights @ v
@@ -101,8 +118,16 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = SwiGLU(config.hidden_size, config.intermediate_size)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache: Cache = None, start_pos: int = 0) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache=cache, start_pos=start_pos)
+    def forward(
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            cache: Cache = None,
+            start_pos: int = None,
+            pad_size: torch.Tensor = None
+            ) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, start_pos, pad_size)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -124,15 +149,24 @@ class Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, x: torch.Tensor, cache: Cache = None, start_pos: int = 0) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            cache: Cache = None,
+            start_pos: int = None,
+            pad_size: torch.Tensor = None
+            ) -> torch.Tensor:
         x = self.embed_tokens(x)
-        T = x.size(1)
-        if cache is None:
+        B, T, _ = x.shape
+        if start_pos is None:
             start_pos = 0
-        # attention slices [start_pos : start_pos + T] itself, so keep the prefix
-        cos, sin = self.cos[:start_pos + T, :], self.sin[:start_pos + T, :]
+        if pad_size is None:
+            pad_size = torch.zeros((B,), dtype=torch.long, device=x.device)
+        positions = start_pos - pad_size[:, None] + torch.arange(T, device=x.device)
+        positions = positions.clamp(min=0)
+        cos, sin = self.cos[positions], self.sin[positions]
         for layer in self.layers:
-            x = layer(x, cos, sin, cache=cache, start_pos=start_pos)
+            x = layer(x, cos, sin, cache, start_pos, pad_size)
         return self.norm(x)
 
 
@@ -145,8 +179,72 @@ class Transformer(nn.Module):
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, x: torch.Tensor, cache: Cache = None, start_pos: int = 0) -> torch.Tensor:
-        return self.lm_head(self.model(x, cache=cache, start_pos=start_pos))
+    def forward(
+            self,
+            x: torch.Tensor,
+            cache: Cache = None,
+            start_pos: int = None,
+            pad_size: torch.Tensor = None
+            ) -> torch.Tensor:
+        return self.lm_head(self.model(x, cache, start_pos, pad_size))
+
+    @staticmethod
+    def _sample_next_token(
+            logits: torch.Tensor,
+            history: torch.Tensor,
+            pad_size: torch.Tensor,
+            temperature: float,
+            top_k: int,
+            top_p: float,
+            repetition_penalty: float,
+            no_repeat_ngram_size: int
+            ) -> torch.Tensor:
+        if repetition_penalty != 1.0:
+            # penalize tokens that already occurred (ignoring left padding)
+            for b in range(history.size(0)):
+                prev_tokens = history[b, int(pad_size[b]):].unique()
+                scores = logits[b, prev_tokens]
+                logits[b, prev_tokens] = torch.where(
+                    scores > 0, scores / repetition_penalty, scores * repetition_penalty)
+
+        if no_repeat_ngram_size > 0:
+            # ban any token that would complete an already seen n-gram
+            n = no_repeat_ngram_size
+            for b in range(history.size(0)):
+                seq = history[b, int(pad_size[b]):].tolist()
+                if len(seq) < n:
+                    continue
+                ngrams = {}
+                for j in range(len(seq) - n + 1):
+                    ngram = tuple(seq[j:j + n])
+                    ngrams.setdefault(ngram[:-1], set()).add(ngram[-1])
+                banned = ngrams.get(tuple(seq[-(n - 1):]), ())
+                if banned:
+                    logits[b, list(banned)] = float('-inf')
+
+        if temperature <= 0:  # greedy decoding
+            return logits.argmax(dim=-1, keepdim=True)
+        logits = logits / temperature
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            kth_value = logits.topk(k, dim=-1).values[..., -1, None]
+            logits = logits.masked_fill(logits < kth_value, float('-inf'))
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            remove = (cumulative_probs - sorted_probs) > top_p
+            sorted_logits = sorted_logits.masked_fill(remove, float('-inf'))
+            logits = torch.zeros_like(sorted_logits).scatter(-1, sorted_indices, sorted_logits)
+        return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+
+    @staticmethod
+    def _assemble_rows(rows: list, fill_id: int, device, dtype) -> torch.Tensor:
+        width = max(t.numel() for t in rows)
+        out = torch.full((len(rows), width), fill_id, dtype=dtype, device=device)
+        for i, t in enumerate(rows):
+            out[i, :t.numel()] = t
+        return out
 
     @torch.no_grad()
     def generate(
@@ -158,61 +256,66 @@ class Transformer(nn.Module):
             top_k: int = 0,
             top_p: float = 1.0,
             repetition_penalty: float = 1.0,
-            no_repeat_ngram_size: int = 0
+            no_repeat_ngram_size: int = 0,
+            eos_token_id: int = None,
+            pad_token_id: int = None
             ) -> torch.Tensor:
         self.eval()
-        generated = input_ids
-        start_pos = 0
+        device = input_ids.device
+        B = input_ids.size(0)
+        if eos_token_id is None:
+            eos_token_id = getattr(self.config, "eos_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.config, "pad_token_id", None)
+        max_seq_len = getattr(self.config, "max_position_embeddings", None)
+        fill_id = pad_token_id if pad_token_id is not None else (eos_token_id if eos_token_id is not None else 0)
+
+        # number of leading pad tokens per row (left padding)
+        if pad_token_id is not None:
+            pad_size = (input_ids == pad_token_id).long().cumprod(dim=1).sum(dim=1)
+        else:
+            pad_size = torch.zeros(B, dtype=torch.long, device=device)
+
+        cur, cur_pad = input_ids, pad_size      # active rows only, shrinks over time
+        row_ids = torch.arange(B, device=device)  # their original batch indices
+        outputs = [None] * B                    # finished rows, by original index
+
+        def finish(done: torch.Tensor) -> bool:
+            """Save finished rows and drop them from the batch/cache.
+            Returns True when no active rows are left."""
+            nonlocal cur, cur_pad, row_ids, cache
+            if not done.any():
+                return False
+            for b in done.nonzero(as_tuple=True)[0]:
+                outputs[row_ids[b]] = cur[b]
+            keep = ~done
+            if not keep.any():
+                return True
+            if cache is not None:
+                cache = cache.subset(keep.nonzero(as_tuple=True)[0])
+            cur, cur_pad, row_ids = cur[keep], cur_pad[keep], row_ids[keep]
+            return False
+
+        # rows already at the config length limit before generating anything
+        if max_seq_len is not None and finish(cur.size(1) - cur_pad >= max_seq_len):
+            return self._assemble_rows(outputs, fill_id, device, input_ids.dtype)
+
         for step in range(max_length):
-            if cache is None:
-                # no cache: recompute the whole sequence on every step
-                logits = self(generated)
-            elif step == 0:
-                logits = self(generated, cache=cache)  # prefill
-                start_pos = generated.size(1)
-            else:
-                logits = self(generated[:, -1:], cache=cache, start_pos=start_pos)
-                start_pos += 1
-            next_token_logits = logits[:, -1, :]
+            tokens = cur if step == 0 or cache is None else cur[:, -1:]
+            logits = self(tokens, cache=cache, start_pos=cur.size(1) - tokens.size(1), pad_size=cur_pad)
+            next_token = self._sample_next_token(
+                logits[:, -1, :], cur, cur_pad, temperature, top_k, top_p,
+                repetition_penalty, no_repeat_ngram_size)
+            cur = torch.cat((cur, next_token), dim=1)
 
-            if repetition_penalty != 1.0:
-                # penalize tokens that already occurred
-                for b in range(generated.size(0)):
-                    prev_tokens = generated[b].unique()
-                    scores = next_token_logits[b, prev_tokens]
-                    next_token_logits[b, prev_tokens] = torch.where(
-                        scores > 0, scores / repetition_penalty, scores * repetition_penalty)
+            done = torch.zeros(cur.size(0), dtype=torch.bool, device=device)
+            if eos_token_id is not None:
+                done |= next_token[:, 0] == eos_token_id
+            if max_seq_len is not None:
+                done |= cur.size(1) - cur_pad >= max_seq_len
+            if finish(done):
+                break
 
-            if no_repeat_ngram_size > 0:
-                # ban any token that would complete an already seen n-gram
-                n = no_repeat_ngram_size
-                for b in range(generated.size(0)):
-                    seq = generated[b].tolist()
-                    if len(seq) < n:
-                        continue
-                    ngrams = {}
-                    for j in range(len(seq) - n + 1):
-                        ngram = tuple(seq[j:j + n])
-                        ngrams.setdefault(ngram[:-1], set()).add(ngram[-1])
-                    banned = ngrams.get(tuple(seq[-(n - 1):]), ())
-                    if banned:
-                        next_token_logits[b, list(banned)] = float('-inf')
-
-            if temperature <= 0:  # greedy decoding
-                next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-            else:
-                next_token_logits = next_token_logits / temperature
-                if top_k > 0:
-                    k = min(top_k, next_token_logits.size(-1))
-                    kth_value = next_token_logits.topk(k, dim=-1).values[..., -1, None]
-                    next_token_logits = next_token_logits.masked_fill(next_token_logits < kth_value, float('-inf'))
-                if top_p < 1.0:  # nucleus sampling: keep the smallest set whose cumulative prob >= top_p
-                    sorted_logits, sorted_indices = next_token_logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1)
-                    cumulative_probs = sorted_probs.cumsum(dim=-1)
-                    remove = (cumulative_probs - sorted_probs) > top_p
-                    sorted_logits = sorted_logits.masked_fill(remove, float('-inf'))
-                    next_token_logits = torch.zeros_like(sorted_logits).scatter(-1, sorted_indices, sorted_logits)
-                next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), num_samples=1)
-            generated = torch.cat((generated, next_token), dim=1)
-        return generated
+        for b, i in enumerate(row_ids):  # rows still active when the loop ended
+            outputs[i] = cur[b]
+        return self._assemble_rows(outputs, fill_id, device, input_ids.dtype)

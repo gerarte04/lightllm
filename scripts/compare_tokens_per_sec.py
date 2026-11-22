@@ -20,8 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from scripts.compare_logits_with_cache import make_cache, sync
-from scripts.compare_logits_with_hf import MODEL_ID, load_our_model
+from tests.helpers import MODEL_ID, load_our_model, make_cache, sync
 
 
 @torch.no_grad()

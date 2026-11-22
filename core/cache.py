@@ -29,3 +29,10 @@ class Cache:
         T = k.size(2)
         self.k[layer, :, :, start_pos:start_pos + T, :] = k
         self.v[layer, :, :, start_pos:start_pos + T, :] = v
+
+    def subset(self, rows: torch.Tensor) -> "Cache":
+        new = Cache(self.n_layers, len(rows), self.n_heads, self.max_len,
+                    self.head_dim, self.device, self.dtype)
+        new.k = self.k[:, rows].clone()
+        new.v = self.v[:, rows].clone()
+        return new
