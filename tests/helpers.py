@@ -11,7 +11,7 @@ from safetensors.torch import load_file
 from core.cache import Cache
 from core.model import Transformer
 
-MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
+MODEL_ID = "Qwen/Qwen3-0.6B"
 
 
 def load_our_model(config, device):
@@ -21,9 +21,9 @@ def load_our_model(config, device):
     weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
     state_dict = load_file(weights_path)
 
-    # SmolLM2 ties input/output embeddings, so the checkpoint may omit
-    # lm_head.weight. Our model ties them too; supply the key so that
-    # strict=True loading sees exactly the same set of parameters.
+    # Qwen3-0.6B ties input/output embeddings. The checkpoint usually ships
+    # lm_head.weight, but if it is omitted our model ties them too; supply the
+    # key so that strict=True loading sees exactly the same set of parameters.
     if config.tie_word_embeddings and "lm_head.weight" not in state_dict:
         state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
 

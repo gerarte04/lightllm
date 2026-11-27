@@ -1,4 +1,4 @@
-"""Logits of core.model.Transformer must match HuggingFace SmolLM2 (float32).
+"""Logits of core.model.Transformer must match HuggingFace Qwen3-0.6B (float32).
 
 Replaces scripts/compare_logits_with_hf.py: our model is loaded from the same
 HF checkpoint with strict=True, and its logits are compared against
@@ -24,11 +24,12 @@ TOP_K = 10
 
 
 @pytest.fixture(scope="module")
-def hf_model():
+def hf_model(env):
+    _, _, _, device = env
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, dtype=torch.float32, attn_implementation="eager"
     )
-    return model.to("cpu").eval()
+    return model.to(device).eval()
 
 
 def test_parameter_count_matches_hf(env, hf_model):
@@ -62,7 +63,7 @@ def test_logits_match_hf(env, hf_model, prompt):
         f"max abs diff {max_diff:.3e}, mean {diff.mean().item():.3e}"
 
     cos = F.cosine_similarity(
-        ours.flatten().double(), hf.flatten().double(), dim=0).item()
+        ours.flatten().cpu().double(), hf.flatten().cpu().double(), dim=0).item()
     assert cos > 0.9999, f"cosine similarity {cos:.8f}"
 
     # both models must pick the same token at every position

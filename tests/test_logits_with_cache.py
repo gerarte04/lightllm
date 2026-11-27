@@ -64,7 +64,7 @@ def assert_logits_match(ref, cached):
     assert max_diff < 1e-3, f"max abs diff {max_diff:.3e}, mean {diff.mean().item():.3e}"
 
     cos = F.cosine_similarity(
-        ref.flatten().double(), cached.flatten().double(), dim=0).item()
+        ref.flatten().cpu().double(), cached.flatten().cpu().double(), dim=0).item()
     assert cos > 0.9999, f"cosine similarity {cos:.8f}"
 
     assert torch.equal(ref.argmax(-1), cached.argmax(-1)), "argmax mismatch"
@@ -114,7 +114,7 @@ def test_token_by_token_decoding_matches_clean(env, input_ids, ref_logits):
 def test_greedy_generate_with_cache_matches(env, input_ids):
     """Greedy generation must produce identical tokens with and without cache."""
     config, _, model, device = env
-    plain = model.generate(input_ids, max_length=GEN_TOKENS, temperature=0.0)
+    plain = model.naive_generate(input_ids, max_length=GEN_TOKENS, temperature=0.0)
     cache = make_cache(config, input_ids.size(0), input_ids.size(1) + GEN_TOKENS, device)
-    cached = model.generate(input_ids, max_length=GEN_TOKENS, cache=cache, temperature=0.0)
+    cached = model.naive_generate(input_ids, max_length=GEN_TOKENS, cache=cache, temperature=0.0)
     assert torch.equal(plain, cached), "greedy tokens differ with/without cache"

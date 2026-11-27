@@ -1,0 +1,31 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "lightllm": {
+      "name": "LightLLM (local)",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8000/v1"
+      },
+      "compatibility": {
+        "maxTokensField": "max_tokens",
+        "streamUsage": false
+      },
+      "models": {
+        "qwen3-0.6b": {
+          "modelID": "Qwen/Qwen3-0.6B",
+          "name": "Qwen3 0.6B (lightllm)",
+          "capabilities": {
+            "tools": false,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    }
+  }
+}

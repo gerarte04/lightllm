@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Transformer.generate() with and without the KV cache (tokens/s).
+"""Benchmark Transformer.naive_generate() with and without the KV cache (tokens/s).
 
 Generates --max-tokens (default 500) new tokens twice: once recomputing the
 whole sequence every step (cache=None) and once with a preallocated Cache.
@@ -30,7 +30,7 @@ def timed_generate(model, config, input_ids, n_tokens, device, use_cache, sampli
 
     sync(device)
     start = time.perf_counter()
-    output = model.generate(input_ids, max_length=n_tokens, cache=cache, **sampling)
+    output = model.naive_generate(input_ids, max_length=n_tokens, cache=cache, **sampling)
     sync(device)
     elapsed = time.perf_counter() - start
 

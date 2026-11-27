@@ -74,13 +74,13 @@ def test_batched_generate_matches_individual(env):
     eos, pad = tokenizer.eos_token_id, tokenizer.pad_token_id
 
     cache = make_cache(config, len(seqs), input_ids.size(1) + N_NEW_TOKENS, device)
-    batched = model.generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
+    batched = model.naive_generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
                              temperature=0.0, eos_token_id=eos, pad_token_id=pad)
 
     n_new_tokens, hit_eos = [], []
     for b, seq in enumerate(seqs):
         single_cache = make_cache(config, 1, seq.numel() + N_NEW_TOKENS, device)
-        ref = model.generate(seq[None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
+        ref = model.naive_generate(seq[None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
                              temperature=0.0, eos_token_id=eos, pad_token_id=pad)[0]
         # both runs use the same stopping rules, so lengths must agree exactly
         check_row(batched[b], pad_size[b], ref, pad)
@@ -103,7 +103,7 @@ def test_generate_stops_at_eos_and_shrinks_batch(env, monkeypatch):
     # Find a token greedy decoding will actually emit for prompt 0, and use
     # it as a fake EOS so that row is guaranteed to finish early.
     probe_cache = make_cache(config, 1, seqs[0].numel() + N_NEW_TOKENS, device)
-    probe = model.generate(seqs[0][None].to(device), max_length=N_NEW_TOKENS, cache=probe_cache,
+    probe = model.naive_generate(seqs[0][None].to(device), max_length=N_NEW_TOKENS, cache=probe_cache,
                            temperature=0.0, eos_token_id=-1, pad_token_id=pad)[0]
     new_tokens = probe[seqs[0].numel():]
     eos = int(new_tokens[15].item())
@@ -122,7 +122,7 @@ def test_generate_stops_at_eos_and_shrinks_batch(env, monkeypatch):
     monkeypatch.setattr(model, "forward", spy)
 
     cache = make_cache(config, len(seqs), input_ids.size(1) + N_NEW_TOKENS, device)
-    batched = model.generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
+    batched = model.naive_generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
                              temperature=0.0, eos_token_id=eos, pad_token_id=pad)
     batched_call_sizes = list(batch_sizes)
 
@@ -135,7 +135,7 @@ def test_generate_stops_at_eos_and_shrinks_batch(env, monkeypatch):
     # every other row must match an individual run with the same fake EOS
     for b in range(1, len(seqs)):
         single_cache = make_cache(config, 1, seqs[b].numel() + N_NEW_TOKENS, device)
-        ref = model.generate(seqs[b][None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
+        ref = model.naive_generate(seqs[b][None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
                              temperature=0.0, eos_token_id=eos, pad_token_id=pad)[0]
         check_row(batched[b], pad_size[b], ref, pad)
 
@@ -154,12 +154,12 @@ def test_generate_stops_at_config_max_length(env, monkeypatch):
     monkeypatch.setattr(model.config, "max_position_embeddings", limit)
 
     cache = make_cache(config, len(seqs), input_ids.size(1) + N_NEW_TOKENS, device)
-    batched = model.generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
+    batched = model.naive_generate(input_ids, max_length=N_NEW_TOKENS, cache=cache,
                              temperature=0.0, eos_token_id=-1, pad_token_id=pad)
 
     for b, seq in enumerate(seqs):
         single_cache = make_cache(config, 1, seq.numel() + N_NEW_TOKENS, device)
-        ref = model.generate(seq[None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
+        ref = model.naive_generate(seq[None].to(device), max_length=N_NEW_TOKENS, cache=single_cache,
                              temperature=0.0, eos_token_id=-1, pad_token_id=pad)[0]
         assert ref.numel() == limit, f"prompt {b}: individual run did not stop at the limit"
         assert limit - real_lens[b] < N_NEW_TOKENS
